@@ -74,3 +74,8 @@ Now any PHP error from your web application will show here in real time.
 
 ---
 
+### **5. run in background and clear and reopen 
+`ctrl+z` for running in background 
+```bash
+clear && sudo truncate -s 0 /var/log/php_errors.log && fg
+```
