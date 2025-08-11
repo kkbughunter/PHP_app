@@ -147,7 +147,15 @@ for more see running ports
 ```bash
 sudo ss -tulpn | grep 3306
 ```
-
+### Runn a Big SQL File in single short 
+Copy the SQL file
+```bash
+sudo docker cp 'file_path/file_name.sql'  mariadb10529:/tmp/sql_query.sql
+```
+Run the SQL file
+```bash
+sudo docker exec -it mariadb10529 bash -c "mariadb -u root -prootpass nadalbus_bgv < /tmp/sql_Query.sql"
+```
 
 
 
