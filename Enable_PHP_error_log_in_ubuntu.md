@@ -1,3 +1,7 @@
+# Enable Apache2 Error Log in LINUX
+```bash
+sudo tail -f /var/log/apache2/error.log
+```
 # Enable PHP Error Log in LINUX
 ## 1. Find Path
 1. Create a test file in your website folder:
@@ -79,3 +83,58 @@ Now any PHP error from your web application will show here in real time.
 ```bash
 clear && sudo truncate -s 0 /var/log/php_errors.log && fg
 ```
+
+# Enable MySQL Error Log in LINUX
+```
+log_error = /var/log/mysql/error.log
+```
+
+inside the `[mysqld]` section of your MySQL or MariaDB server configuration file.
+
+On Ubuntu 24.04, the typical main config files to check are:
+
+* `/etc/mysql/mysql.conf.d/mysqld.cnf`
+* `/etc/mysql/my.cnf` (sometimes just includes others)
+* or any file inside `/etc/mysql/mysql.conf.d/`
+
+**Steps:**
+
+1. Open the main mysqld config file:
+
+```bash
+sudo nano /etc/mysql/mysql.conf.d/mysqld.cnf
+```
+
+2. Find the `[mysqld]` section (it should be near the top).
+
+3. Add the line below inside that section:
+
+```
+log_error = /var/log/mysql/error.log
+```
+
+4. Save and exit.
+
+5. Make sure the directory and file exist and are writable by MySQL:
+
+```bash
+sudo mkdir -p /var/log/mysql
+sudo touch /var/log/mysql/error.log
+sudo chown mysql:mysql /var/log/mysql/error.log
+```
+
+6. Restart MySQL server:
+
+```bash
+sudo systemctl restart mysql
+```
+
+Now your MySQL error logs will be written to `/var/log/mysql/error.log`. You can view them with:
+
+```bash
+sudo tail -f /var/log/mysql/error.log
+```
+
+---
+
+
