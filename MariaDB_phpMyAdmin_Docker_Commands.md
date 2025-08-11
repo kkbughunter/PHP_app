@@ -88,4 +88,66 @@ sudo docker stop mariadb10529
 sudo docker logs mariadb10529
 ```
 
+# [OR] Run Auto mode
+Create a yml file named `docker-compose.yml`
+```yml
+
+version: '3.8'
+
+services:
+  mariadb:
+    image: mariadb:10.5
+    container_name: mariadb10529
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: mydb
+      MYSQL_USER: myuser
+      MYSQL_PASSWORD: mypass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: phpmyadmin
+    environment:
+      PMA_HOST: mariadb
+      PMA_PORT: 3306
+    ports:
+      - "8080:80"
+    depends_on:
+      - mariadb
+
+volumes:
+  mariadb_data:
+```
+Restart docker
+```bash
+sudo systemctl restart docker
+```
+Up the Container
+```bash
+sudo docker-compose up -d
+```
+See the services running 
+```bash
+sudo docker ps
+```
+view all 
+```bash
+sudo docker ps -a
+```
+Down all
+Up the Container
+```bash
+sudo docker-compose down
+```
+for more see running ports 
+```bash
+sudo ss -tulpn | grep 3306
+```
+
+
+
 
