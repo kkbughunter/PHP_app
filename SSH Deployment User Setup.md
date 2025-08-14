@@ -20,7 +20,10 @@ sudo mkdir -p /home/developer1/.ssh
 sudo chmod 700 /home/developer1/.ssh
 sudo chown developer1:developer1 /home/developer1/.ssh
 ```
-
+```bash
+sudo chown -R developer1:developer1 /home/developer1/.ssh
+sudo chmod 700 /home/developer1/.ssh
+```
 ### Add Your Public Key
 
 On your **local machine**:
