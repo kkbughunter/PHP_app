@@ -1,0 +1,352 @@
+<?php
+
+/**
+ * Replace %*varName*% placeholders in a DOCX, including images, even when broken across runs,
+ * without changing styles. Writes to a new output file.
+ *
+ * Requirements: ext-dom, ext-zip
+ */
+function replaceDocxPlaceholdersSmart(string $inputDocx, string $outputDocx, array $replacements): void
+{
+    if (!is_file($inputDocx)) {
+        throw new RuntimeException("Input file not found: $inputDocx");
+    }
+
+    // Work on a copy so the template is untouched.
+    if (!@copy($inputDocx, $outputDocx)) {
+        throw new RuntimeException("Failed to copy template to: $outputDocx");
+    }
+
+    $zip = new ZipArchive();
+    if ($zip->open($outputDocx) !== true) {
+        throw new RuntimeException("Unable to open DOCX: $outputDocx");
+    }
+
+    // Process the main document.xml plus any headers/footers if present.
+    $parts = ['word/document.xml'];
+    for ($i = 1; $i <= 8; $i++) {
+        foreach (["word/header$i.xml", "word/footer$i.xml"] as $p) {
+            if ($zip->locateName($p) !== false) $parts[] = $p;
+        }
+    }
+
+    // Load and update document relationships for images
+    $relsPath = 'word/_rels/document.xml.rels';
+    $relsXml = $zip->getFromName($relsPath);
+    if ($relsXml === false) {
+        throw new RuntimeException("Unable to load relationships file: $relsPath");
+    }
+    $relsDoc = new DOMDocument();
+    $relsDoc->preserveWhiteSpace = true;
+    $relsDoc->formatOutput = false;
+    $relsDoc->loadXML($relsXml);
+    $relsXp = new DOMXPath($relsDoc);
+    $relsXp->registerNamespace('r', 'http://schemas.openxmlformats.org/package/2006/relationships');
+
+    $imageRelationships = []; // Track image IDs and paths
+    $imageCounter = 1; // For generating unique rId and image names
+
+    foreach ($parts as $partPath) {
+        $index = $zip->locateName($partPath);
+        if ($index === false) continue;
+
+        $xmlData = $zip->getFromIndex($index);
+        $newXml = replaceInWordXml($xmlData, $replacements, $zip, $relsDoc, $relsXp, $imageRelationships, $imageCounter);
+
+        // Overwrite the XML part
+        $zip->deleteName($partPath);
+        $zip->addFromString($partPath, $newXml);
+    }
+
+    // Update relationships XML
+    $zip->deleteName($relsPath);
+    $zip->addFromString($relsPath, $relsDoc->saveXML());
+
+    // Add images to the zip
+    foreach ($imageRelationships as $rId => $imageInfo) {
+        if (!file_exists($imageInfo['path'])) {
+            throw new RuntimeException("Image file not found: {$imageInfo['path']}");
+        }
+        $zip->addFile($imageInfo['path'], "word/media/{$imageInfo['name']}");
+    }
+
+    $zip->close();
+}
+
+/**
+ * Core logic: walk each paragraph, scan its w:t nodes in order,
+ * find %*...*% (across nodes), and replace with text or image structure.
+ */
+function replaceInWordXml(string $xmlData, array $replacements, ZipArchive $zip, DOMDocument $relsDoc, DOMXPath $relsXp, array &$imageRelationships, int &$imageCounter): string
+{
+    $doc = new DOMDocument();
+    $doc->preserveWhiteSpace = true;
+    $doc->formatOutput = false;
+    if (!$doc->loadXML($xmlData)) {
+        throw new RuntimeException("Failed to load XML data");
+    }
+
+    $xp = new DOMXPath($doc);
+    $xp->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+    $xp->registerNamespace('wp', 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing');
+    $xp->registerNamespace('a', 'http://schemas.openxmlformats.org/drawingml/2006/main');
+    $xp->registerNamespace('pic', 'http://schemas.openxmlformats.org/drawingml/2006/picture');
+    $xp->registerNamespace('r', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships');
+
+    $paragraphs = $xp->query('//w:p');
+    foreach ($paragraphs as $p) {
+        // Collect runs to avoid live NodeList issues
+        $runNodes = $xp->query('.//w:r', $p);
+        $runs = [];
+        foreach ($runNodes as $run) {
+            $tNode = $xp->query('w:t', $run)->item(0);
+            $runs[] = ['run' => $run, 'textNode' => $tNode];
+        }
+
+        $i = 0;
+        while ($i < count($runs)) {
+            $startRun = $runs[$i]['run'];
+            $startTextNode = $runs[$i]['textNode'];
+            $startText = $startTextNode ? $startTextNode->nodeValue : '';
+            $posStart = strpos($startText, '%*');
+
+            if ($posStart === false) {
+                $i++;
+                continue;
+            }
+
+            // Found a start marker
+            $startIndex = $i;
+            $startOffset = $posStart;
+            $varText = '';
+            $endFound = false;
+            $endIndex = $startIndex;
+            $endOffset = null;
+
+            // Check if end marker is in the same node
+            $afterStart = substr($startText, $startOffset + 2);
+            $posEndSame = strpos($afterStart, '*%');
+            if ($posEndSame !== false) {
+                // Same-node placeholder
+                $varRaw = substr($afterStart, 0, $posEndSame);
+                $trailing = substr($afterStart, $posEndSame + 2);
+                $leading = substr($startText, 0, $startOffset);
+                $varName = preg_replace('/\s+/', '', $varRaw);
+
+                if (isset($replacements[$varName]) && is_array($replacements[$varName]) && isset($replacements[$varName]['image'])) {
+                    // Image replacement
+                    $imageData = $replacements[$varName];
+                    $rId = "rIdImg" . $imageCounter++;
+                    $imageName = "image" . $imageCounter . "." . pathinfo($imageData['image'], PATHINFO_EXTENSION);
+                    $imageRelationships[$rId] = [
+                        'path' => $imageData['image'],
+                        'name' => $imageName
+                    ];
+
+                    // Add relationship
+                    $relNode = $relsDoc->createElementNS('http://schemas.openxmlformats.org/package/2006/relationships', 'r:Relationship');
+                    $relNode->setAttribute('Id', $rId);
+                    $relNode->setAttribute('Type', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image');
+                    $relNode->setAttribute('Target', "media/$imageName");
+                    $relsDoc->documentElement->appendChild($relNode);
+
+                    // Create image run
+                    $imageXml = createImageXml($rId, $imageName, $imageData['width'] ?? 300, $imageData['height'] ?? 300);
+                    $imageFragment = $doc->createDocumentFragment();
+                    if (!$imageFragment->appendXML($imageXml)) {
+                        throw new RuntimeException("Failed to append image XML for $varName");
+                    }
+
+                    // Replace the entire run
+                    if ($startRun->parentNode) {
+                        $startRun->parentNode->replaceChild($imageFragment, $startRun);
+                    }
+                } else {
+                    // Text replacement
+                    $replacement = array_key_exists($varName, $replacements) ? (string)$replacements[$varName] : null;
+                    if ($replacement !== null) {
+                        $startTextNode->nodeValue = $leading . $replacement . $trailing;
+                    } else {
+                        $startTextNode->nodeValue = $leading . $varRaw . $trailing;
+                    }
+                }
+                $i++;
+                continue;
+            }
+
+            // Multi-node placeholder
+            $varText .= $afterStart;
+            for ($j = $startIndex + 1; $j < count($runs); $j++) {
+                $endTextNode = $runs[$j]['textNode'];
+                $endCandidate = $endTextNode ? $endTextNode->nodeValue : '';
+                $posEnd = strpos($endCandidate, '*%');
+                if ($posEnd === false) {
+                    $varText .= $endCandidate;
+                    continue;
+                }
+                $varText .= substr($endCandidate, 0, $posEnd);
+                $endIndex = $j;
+                $endOffset = $posEnd;
+                $endFound = true;
+                break;
+            }
+
+            if (!$endFound) {
+                $i++;
+                continue;
+            }
+
+            $leadingStart = substr($startText, 0, $startOffset);
+            $endTextNode = $runs[$endIndex]['textNode'];
+            $endNodeText = $endTextNode ? $endTextNode->nodeValue : '';
+            $trailingEnd = substr($endNodeText, $endOffset + 2);
+            $varName = preg_replace('/\s+/', '', $varText);
+
+            if (isset($replacements[$varName]) && is_array($replacements[$varName]) && isset($replacements[$varName]['image'])) {
+                // Image replacement
+                $imageData = $replacements[$varName];
+                $rId = "rIdImg" . $imageCounter++;
+                $imageName = "image" . $imageCounter . "." . pathinfo($imageData['image'], PATHINFO_EXTENSION);
+                $imageRelationships[$rId] = [
+                    'path' => $imageData['image'],
+                    'name' => $imageName
+                ];
+
+                // Add relationship
+                $relNode = $relsDoc->createElementNS('http://schemas.openxmlformats.org/package/2006/relationships', 'r:Relationship');
+                $relNode->setAttribute('Id', $rId);
+                $relNode->setAttribute('Type', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image');
+                $relNode->setAttribute('Target', "media/$imageName");
+                $relsDoc->documentElement->appendChild($relNode);
+
+                // Create image run
+                $imageXml = createImageXml($rId, $imageName, $imageData['width'] ?? 300, $imageData['height'] ?? 300);
+                $imageFragment = $doc->createDocumentFragment();
+                if (!$imageFragment->appendXML($imageXml)) {
+                    throw new RuntimeException("Failed to append image XML for $varName");
+                }
+
+                // Replace the start run with the image
+                if ($startRun->parentNode) {
+                    $startRun->parentNode->replaceChild($imageFragment, $startRun);
+                }
+
+                // Remove middle runs
+                for ($k = $startIndex + 1; $k < $endIndex; $k++) {
+                    if ($runs[$k]['run']->parentNode) {
+                        $runs[$k]['run']->parentNode->removeChild($runs[$k]['run']);
+                    }
+                }
+
+                // Update end run
+                if ($endTextNode) {
+                    $endTextNode->nodeValue = $trailingEnd;
+                }
+            } else {
+                // Text replacement
+                $replacement = array_key_exists($varName, $replacements) ? (string)$replacements[$varName] : null;
+                if ($replacement !== null) {
+                    $startTextNode->nodeValue = $leadingStart . $replacement;
+                } else {
+                    $startTextNode->nodeValue = $leadingStart . $varText;
+                }
+
+                for ($k = $startIndex + 1; $k < $endIndex; $k++) {
+                    if ($runs[$k]['textNode']) {
+                        $runs[$k]['textNode']->nodeValue = '';
+                    }
+                }
+
+                if ($endTextNode) {
+                    $endTextNode->nodeValue = $trailingEnd;
+                }
+            }
+
+            $i = $endIndex + 1;
+        }
+    }
+
+    return $doc->saveXML();
+}
+
+/**
+ * Generate WordprocessingML for an image with proper namespace declarations.
+ */
+function createImageXml(string $rId, string $imageName, int $widthPx, int $heightPx): string
+{
+    // Convert pixels to EMUs (1 px = 9525 EMUs)
+    $widthEmu = $widthPx * 9525;
+    $heightEmu = $heightPx * 9525;
+
+    // Define all necessary namespaces in the root element
+    return <<<XML
+<w:r
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+    xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+    xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"
+    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+    <w:drawing>
+        <wp:inline distT="0" distB="0" distL="0" distR="0">
+            <wp:extent cx="$widthEmu" cy="$heightEmu"/>
+            <wp:docPr id="1" name="$imageName"/>
+            <a:graphic>
+                <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                    <pic:pic>
+                        <pic:nvPicPr>
+                            <pic:cNvPr id="0" name="$imageName"/>
+                            <pic:cNvPicPr/>
+                        </pic:nvPicPr>
+                        <pic:blipFill>
+                            <a:blip r:embed="$rId"/>
+                            <a:stretch>
+                                <a:fillRect/>
+                            </a:stretch>
+                        </pic:blipFill>
+                        <pic:spPr>
+                            <a:xfrm>
+                                <a:off x="0" y="0"/>
+                                <a:ext cx="$widthEmu" cy="$heightEmu"/>
+                            </a:xfrm>
+                            <a:prstGeom prst="rect">
+                                <a:avLst/>
+                            </a:prstGeom>
+                        </pic:spPr>
+                    </pic:pic>
+                </a:graphicData>
+            </a:graphic>
+        </wp:inline>
+    </w:drawing>
+</w:r>
+XML;
+}
+
+// ------------------------------ Example usage ------------------------------
+$values = [
+    'variable' => 'Hello!....',
+    'employerName' => 'Google Inc.',
+    'CaseID' => 'BGV123456',
+    'cName' => 'John Doe',
+    'reportStatus' => 'Clear',
+    'dob' => '1990-01-01',
+    'reuestDate' => '2025-08-20',
+    'cID' => 'CID-98765',
+    'reportDate' => '2025-08-21',
+    'img1' => [
+        'image' => 'C:\xampp\htdocs\test\pdfgenback\openxml\image1.jpg',
+        'width' => 300,
+        'height' => 300
+    ],
+    'img2' => [
+        'image' => 'C:\xampp\htdocs\test\pdfgenback\openxml\image2.jpg',
+        'width' => 300,
+        'height' => 300
+    ]
+];
+$template = 'input.docx';
+$output = 'output.docx';
+
+replaceDocxPlaceholdersSmart($template, $output, $values);
+
+echo "✅ Created $output\n";
+?>
