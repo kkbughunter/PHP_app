@@ -3,6 +3,7 @@
 /**
  * Replace %*varName*% placeholders in a DOCX, including images and tables, even when broken across runs,
  * and handle table row placeholders (e.g., arg_tX, arg_taX), adding new rows with preserved styling.
+ * Supports optional cell background and font color for table replacements.
  * Writes to a new output file.
  *
  * Requirements: ext-dom, ext-zip
@@ -62,13 +63,14 @@ function replaceDocxPlaceholdersSmart(string $inputDocx, string $outputDocx, arr
     $imageRelationships = []; // Track image IDs and paths
     $imageCounter = 1; // For generating unique rId and image names
     $imageExtensions = []; // Track image extensions for content types
+    $imageCounters = []; // Track counters for each image placeholder type
 
     foreach ($parts as $partPath) {
         $index = $zip->locateName($partPath);
         if ($index === false) continue;
 
         $xmlData = $zip->getFromIndex($index);
-        $newXml = replaceInWordXml($xmlData, $replacements, $zip, $relsDoc, $relsXp, $contentTypesDoc, $contentTypesXp, $imageRelationships, $imageCounter, $imageExtensions);
+        $newXml = replaceInWordXml($xmlData, $replacements, $zip, $relsDoc, $relsXp, $contentTypesDoc, $contentTypesXp, $imageRelationships, $imageCounter, $imageExtensions, $imageCounters);
 
         // Overwrite the XML part
         $zip->deleteName($partPath);
@@ -103,12 +105,62 @@ function replaceDocxPlaceholdersSmart(string $inputDocx, string $outputDocx, arr
 
     $zip->close();
 }
+/**
+ * Generate WordprocessingML for an image with proper namespace declarations.
+ */
+function createImageXml(string $rId, string $imageName, int $widthPx, int $heightPx): string
+{
+    // Convert pixels to EMUs (1 px = 9525 EMUs)
+    $widthEmu = $widthPx * 9525;
+    $heightEmu = $heightPx * 9525;
 
+    // Define all necessary namespaces in the root element
+    return <<<XML
+<w:r
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+    xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+    xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"
+    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+    <w:drawing>
+        <wp:inline distT="0" distB="0" distL="0" distR="0">
+            <wp:extent cx="$widthEmu" cy="$heightEmu"/>
+            <wp:docPr id="1" name="$imageName"/>
+            <a:graphic>
+                <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+                    <pic:pic>
+                        <pic:nvPicPr>
+                            <pic:cNvPr id="0" name="$imageName"/>
+                            <pic:cNvPicPr/>
+                        </pic:nvPicPr>
+                        <pic:blipFill>
+                            <a:blip r:embed="$rId"/>
+                            <a:stretch>
+                                <a:fillRect/>
+                            </a:stretch>
+                        </pic:blipFill>
+                        <pic:spPr>
+                            <a:xfrm>
+                                <a:off x="0" y="0"/>
+                                <a:ext cx="$widthEmu" cy="$heightEmu"/>
+                            </a:xfrm>
+                            <a:prstGeom prst="rect">
+                                <a:avLst/>
+                            </a:prstGeom>
+                        </pic:spPr>
+                    </pic:pic>
+                </a:graphicData>
+            </a:graphic>
+        </wp:inline>
+    </w:drawing>
+</w:r>
+XML;
+}
 /**
  * Core logic: walk each paragraph and table, scan w:t nodes for %*...*% placeholders,
  * replace with text, image, or table structure, and handle table row placeholders.
  */
-function replaceInWordXml(string $xmlData, array $replacements, ZipArchive $zip, DOMDocument $relsDoc, DOMXPath $relsXp, DOMDocument $contentTypesDoc, DOMXPath $contentTypesXp, array &$imageRelationships, int &$imageCounter, array &$imageExtensions): string
+function replaceInWordXml(string $xmlData, array $replacements, ZipArchive $zip, DOMDocument $relsDoc, DOMXPath $relsXp, DOMDocument $contentTypesDoc, DOMXPath $contentTypesXp, array &$imageRelationships, int &$imageCounter, array &$imageExtensions, array &$imageCounters): string
 {
     $doc = new DOMDocument();
     $doc->preserveWhiteSpace = true;
@@ -165,8 +217,58 @@ function replaceInWordXml(string $xmlData, array $replacements, ZipArchive $zip,
                 $leading = substr($startText, 0, $startOffset);
                 $varName = preg_replace('/\s+/', '', $varRaw);
 
-                if (isset($replacements[$varName]) && is_array($replacements[$varName]) && isset($replacements[$varName]['image'])) {
-                    // Image replacement
+                // Check for image placeholder with (i) pattern
+                if (preg_match('/^(.+)\(i\)$/', $varName, $matches)) {
+                    $baseImageName = $matches[1];
+                    if (isset($replacements[$varName]) && is_array($replacements[$varName])) {
+                        // Create multiple paragraphs with images
+                        $imageXmlParts = [];
+                        foreach ($replacements[$varName] as $imageKey => $imageData) {
+                            if (is_array($imageData) && isset($imageData['image'])) {
+                                $ext = strtolower(pathinfo($imageData['image'], PATHINFO_EXTENSION));
+                                $imageExtensions[$ext] = true;
+                                $rId = "rIdImg" . $imageCounter++;
+                                
+                                // Generate sequential filename
+                                if (!isset($imageCounters[$baseImageName])) {
+                                    $imageCounters[$baseImageName] = 1;
+                                }
+                                $imageName = $baseImageName . "-" . $imageCounters[$baseImageName]++ . "." . $ext;
+                                
+                                $imageRelationships[$rId] = [
+                                    'path' => $imageData['image'],
+                                    'name' => $imageName
+                                ];
+                                
+                                // Add relationship
+                                $relNode = $relsDoc->createElementNS('http://schemas.openxmlformats.org/package/2006/relationships', 'r:Relationship');
+                                $relNode->setAttribute('Id', $rId);
+                                $relNode->setAttribute('Type', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image');
+                                $relNode->setAttribute('Target', "media/$imageName");
+                                $relsDoc->documentElement->appendChild($relNode);
+                                
+                                // Create image paragraph
+                                $imageXml = createImageXml($rId, $imageName, $imageData['width'] ?? 300, $imageData['height'] ?? 300);
+                                $imageXmlParts[] = '<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' . $imageXml . '</w:p>';
+                            }
+                        }
+                        
+                        if (!empty($imageXmlParts)) {
+                            $combinedXml = implode('', $imageXmlParts);
+                            $imageFragment = $doc->createDocumentFragment();
+                            if (!$imageFragment->appendXML($combinedXml)) {
+                                throw new RuntimeException("Failed to append image XML for $varName");
+                            }
+                            
+                            // Replace the entire paragraph
+                            if ($p->parentNode) {
+                                $p->parentNode->replaceChild($imageFragment, $p);
+                            }
+                            break; // Exit loop since paragraph is replaced
+                        }
+                    }
+                } elseif (isset($replacements[$varName]) && is_array($replacements[$varName]) && isset($replacements[$varName]['image'])) {
+                    // Single image replacement
                     $imageData = $replacements[$varName];
                     $ext = strtolower(pathinfo($imageData['image'], PATHINFO_EXTENSION));
                     $imageExtensions[$ext] = true;
@@ -250,8 +352,58 @@ function replaceInWordXml(string $xmlData, array $replacements, ZipArchive $zip,
             $trailingEnd = substr($endNodeText, $endOffset + 2);
             $varName = preg_replace('/\s+/', '', $varText);
 
-            if (isset($replacements[$varName]) && is_array($replacements[$varName]) && isset($replacements[$varName]['image'])) {
-                // Image replacement
+            // Check for image placeholder with (i) pattern
+            if (preg_match('/^(.+)\(i\)$/', $varName, $matches)) {
+                $baseImageName = $matches[1];
+                if (isset($replacements[$varName]) && is_array($replacements[$varName])) {
+                    // Create multiple paragraphs with images
+                    $imageXmlParts = [];
+                    foreach ($replacements[$varName] as $imageKey => $imageData) {
+                        if (is_array($imageData) && isset($imageData['image'])) {
+                            $ext = strtolower(pathinfo($imageData['image'], PATHINFO_EXTENSION));
+                            $imageExtensions[$ext] = true;
+                            $rId = "rIdImg" . $imageCounter++;
+                            
+                            // Generate sequential filename
+                            if (!isset($imageCounters[$baseImageName])) {
+                                $imageCounters[$baseImageName] = 1;
+                            }
+                            $imageName = $baseImageName . "-" . $imageCounters[$baseImageName]++ . "." . $ext;
+                            
+                            $imageRelationships[$rId] = [
+                                'path' => $imageData['image'],
+                                'name' => $imageName
+                            ];
+                            
+                            // Add relationship
+                            $relNode = $relsDoc->createElementNS('http://schemas.openxmlformats.org/package/2006/relationships', 'r:Relationship');
+                            $relNode->setAttribute('Id', $rId);
+                            $relNode->setAttribute('Type', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image');
+                            $relNode->setAttribute('Target', "media/$imageName");
+                            $relsDoc->documentElement->appendChild($relNode);
+                            
+                            // Create image paragraph
+                            $imageXml = createImageXml($rId, $imageName, $imageData['width'] ?? 300, $imageData['height'] ?? 300);
+                            $imageXmlParts[] = '<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' . $imageXml . '</w:p>';
+                        }
+                    }
+                    
+                    if (!empty($imageXmlParts)) {
+                        $combinedXml = implode('', $imageXmlParts);
+                        $imageFragment = $doc->createDocumentFragment();
+                        if (!$imageFragment->appendXML($combinedXml)) {
+                            throw new RuntimeException("Failed to append image XML for $varName");
+                        }
+                        
+                        // Replace the entire paragraph
+                        if ($p->parentNode) {
+                            $p->parentNode->replaceChild($imageFragment, $p);
+                        }
+                        break; // Exit loop since paragraph is replaced
+                    }
+                }
+            } elseif (isset($replacements[$varName]) && is_array($replacements[$varName]) && isset($replacements[$varName]['image'])) {
+                // Single image replacement
                 $imageData = $replacements[$varName];
                 $ext = strtolower(pathinfo($imageData['image'], PATHINFO_EXTENSION));
                 $imageExtensions[$ext] = true;
@@ -340,7 +492,7 @@ function replaceInWordXml(string $xmlData, array $replacements, ZipArchive $zip,
 }
 
 /**
- * Process table rows to replace placeholders and add new rows with preserved styling.
+ * Process table rows to replace placeholders and add new rows with preserved or user-specified styling.
  */
 function processTableRows(DOMElement $table, array $replacements, DOMXPath $xp, DOMDocument $doc): void
 {
@@ -406,30 +558,59 @@ function processTableRows(DOMElement $table, array $replacements, DOMXPath $xp, 
                                 foreach ($placeholders[$cellIndex] as $placeholder) {
                                     $colVarName = preg_replace('/%*|\*/', '', $placeholder);
                                     $colIndex = (int)preg_replace('/^arg_t(a)?/', '', $colVarName) - 1;
-                                    $replacement = isset($firstRowData[$colIndex]) ? (string)$firstRowData[$colIndex] : '';
+                                    $cellValue = isset($firstRowData[$colIndex]) ? (string)(is_array($firstRowData[$colIndex]) ? ($firstRowData[$colIndex]['value'] ?? $firstRowData[$colIndex]) : $firstRowData[$colIndex]) : '';
                                     $textNodes = $xp->query('.//w:t', $cell);
                                     foreach ($textNodes as $tNode) {
-                                        $tNode->nodeValue = str_replace($placeholder, $replacement, $tNode->nodeValue);
+                                        $tNode->nodeValue = str_replace($placeholder, $cellValue, $tNode->nodeValue);
                                     }
                                 }
                             }
                         }
                     }
 
-                    // Add new rows with preserved styling
+                    // Add new rows with preserved styling from the row above or user-specified colors
                     foreach ($tableData as $rowData) {
                         $newRowXml = '<w:tr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">';
-                        foreach ($rowData as $cellIndex => $cellValue) {
+                        foreach ($rowData as $cellIndex => $cellData) {
+                            $cellValue = is_array($cellData) ? ($cellData['value'] ?? $cellData) : $cellData;
+                            $bgColor = is_array($cellData) && isset($cellData['bgColor']) ? $cellData['bgColor'] : null;
+                            $fontColor = is_array($cellData) && isset($cellData['fontColor']) ? $cellData['fontColor'] : null;
+
                             $newRowXml .= '<w:tc>';
                             $newRowXml .= $cellProperties[$cellIndex] ?? '<w:tcPr><w:tcW w:w="0" w:type="auto"/></w:tcPr>';
+                            if ($bgColor) {
+                                $newRowXml .= "<w:tcPr><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"$bgColor\"/></w:tcPr>";
+                            }
                             $newRowXml .= '<w:p>';
                             if (!empty($paraProperties[$cellIndex])) {
                                 $newRowXml .= $paraProperties[$cellIndex];
                             }
                             $newRowXml .= '<w:r>';
-                            if (!empty($runProperties[$cellIndex])) {
-                                $newRowXml .= $runProperties[$cellIndex];
+                            // Preserve all run properties, only override color if specified
+                            $runXml = $runProperties[$cellIndex] ?? '';
+                            if ($fontColor && $runXml) {
+                                // Modify existing run properties to update color only
+                                $runDoc = new DOMDocument();
+                                $runDoc->loadXML('<root xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' . $runXml . '</root>');
+                                $runXp = new DOMXPath($runDoc);
+                                $runXp->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+                                $colorNode = $runXp->query('//w:color')->item(0);
+                                if ($colorNode) {
+                                    $colorNode->setAttribute('w:val', $fontColor);
+                                } else {
+                                    $rPrNode = $runXp->query('//w:rPr')->item(0);
+                                    if ($rPrNode) {
+                                        $newColorNode = $runDoc->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:color');
+                                        $newColorNode->setAttribute('w:val', $fontColor);
+                                        $rPrNode->appendChild($newColorNode);
+                                    }
+                                }
+                                $runXml = $runDoc->saveXML($runDoc->documentElement->firstChild);
+                            } elseif ($fontColor) {
+                                // If no run properties exist, create minimal with font color
+                                $runXml = "<w:rPr><w:color w:val=\"$fontColor\"/><w:sz w:val=\"22\"/></w:rPr>";
                             }
+                            $newRowXml .= $runXml;
                             $newRowXml .= '<w:t>' . htmlspecialchars((string)$cellValue, ENT_QUOTES, 'UTF-8') . '</w:t></w:r></w:p>';
                             $newRowXml .= '</w:tc>';
                         }
@@ -447,59 +628,7 @@ function processTableRows(DOMElement $table, array $replacements, DOMXPath $xp, 
 }
 
 /**
- * Generate WordprocessingML for an image with proper namespace declarations.
- */
-function createImageXml(string $rId, string $imageName, int $widthPx, int $heightPx): string
-{
-    // Convert pixels to EMUs (1 px = 9525 EMUs)
-    $widthEmu = $widthPx * 9525;
-    $heightEmu = $heightPx * 9525;
-
-    // Define all necessary namespaces in the root element
-    return <<<XML
-<w:r
-    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-    xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
-    xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
-    xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"
-    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-    <w:drawing>
-        <wp:inline distT="0" distB="0" distL="0" distR="0">
-            <wp:extent cx="$widthEmu" cy="$heightEmu"/>
-            <wp:docPr id="1" name="$imageName"/>
-            <a:graphic>
-                <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
-                    <pic:pic>
-                        <pic:nvPicPr>
-                            <pic:cNvPr id="0" name="$imageName"/>
-                            <pic:cNvPicPr/>
-                        </pic:nvPicPr>
-                        <pic:blipFill>
-                            <a:blip r:embed="$rId"/>
-                            <a:stretch>
-                                <a:fillRect/>
-                            </a:stretch>
-                        </pic:blipFill>
-                        <pic:spPr>
-                            <a:xfrm>
-                                <a:off x="0" y="0"/>
-                                <a:ext cx="$widthEmu" cy="$heightEmu"/>
-                            </a:xfrm>
-                            <a:prstGeom prst="rect">
-                                <a:avLst/>
-                            </a:prstGeom>
-                        </pic:spPr>
-                    </pic:pic>
-                </a:graphicData>
-            </a:graphic>
-        </wp:inline>
-    </w:drawing>
-</w:r>
-XML;
-}
-
-/**
- * Generate WordprocessingML for a full table, optionally using template styling.
+ * Generate WordprocessingML for a full table, optionally using template styling and user-specified colors.
  */
 function createTableXml(array $tableData, bool $useTemplateStyle = false): string
 {
@@ -526,7 +655,7 @@ function createTableXml(array $tableData, bool $useTemplateStyle = false): strin
     $xml .= '<w:tblGrid>';
 
     // Assume equal column widths for simplicity
-    $colCount = count($tableData[0]);
+    $colCount = count(isset($tableData[0]) && is_array($tableData[0]) ? $tableData[0] : []);
     for ($i = 0; $i < $colCount; $i++) {
         $xml .= '<w:gridCol w:w="' . ($useTemplateStyle ? 1250 : 0) . '"/>';
     }
@@ -534,24 +663,25 @@ function createTableXml(array $tableData, bool $useTemplateStyle = false): strin
 
     foreach ($tableData as $rowIndex => $row) {
         $xml .= '<w:tr>';
-        foreach ($row as $cellIndex => $cell) {
+        foreach ($row as $cellIndex => $cellData) {
+            $cellValue = is_array($cellData) ? ($cellData['value'] ?? $cellData) : $cellData;
+            $bgColor = is_array($cellData) && isset($cellData['bgColor']) ? $cellData['bgColor'] : ($rowIndex == 0 && $useTemplateStyle ? '0070C0' : null);
+            $fontColor = is_array($cellData) && isset($cellData['fontColor']) ? $cellData['fontColor'] : ($rowIndex == 0 && $useTemplateStyle ? 'FFFFFF' : ($rowIndex > 0 && $cellIndex == $colCount - 1 && $useTemplateStyle ? '00B050' : null));
+
             $xml .= '<w:tc>';
             $xml .= '<w:tcPr><w:tcW w:w="' . ($useTemplateStyle ? 1250 : 0) . '" w:type="dxa"/>';
-            if ($rowIndex == 0 && $useTemplateStyle) {
-                // Blue background for header row
-                $xml .= '<w:shd w:val="clear" w:color="auto" w:fill="0070C0"/>';
+            if ($bgColor) {
+                $xml .= "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"$bgColor\"/>";
             }
             $xml .= '</w:tcPr>';
             $xml .= '<w:p><w:pPr><w:jc w:val="' . ($useTemplateStyle ? 'center' : 'left') . '"/></w:pPr><w:r>';
-            if ($rowIndex == 0 && $useTemplateStyle) {
-                $xml .= '<w:rPr><w:sz w:val="24"/><w:color w:val="FFFFFF"/></w:rPr>';
-            } elseif ($rowIndex > 0 && $cellIndex == $colCount - 1 && $useTemplateStyle) {
-                // Green text for remarks column in body rows
-                $xml .= '<w:rPr><w:sz w:val="22"/><w:color w:val="00B050"/></w:rPr>';
+            // Preserve existing run properties, only override color if specified
+            if ($fontColor) {
+                $xml .= "<w:rPr><w:sz w:val=\"" . ($rowIndex == 0 && $useTemplateStyle ? 24 : 22) . "\"/><w:color w:val=\"$fontColor\"/></w:rPr>";
             } elseif ($useTemplateStyle) {
-                $xml .= '<w:rPr><w:sz w:val="22"/><w:color w:val="000000"/></w:rPr>';
+                $xml .= '<w:rPr><w:sz w:val="' . ($rowIndex == 0 ? 24 : 22) . '"/></w:rPr>';
             }
-            $xml .= '<w:t>' . htmlspecialchars((string)$cell, ENT_QUOTES, 'UTF-8') . '</w:t>';
+            $xml .= '<w:t>' . htmlspecialchars((string)$cellValue, ENT_QUOTES, 'UTF-8') . '</w:t>';
             $xml .= '</w:r></w:p>';
             $xml .= '</w:tc>';
         }
@@ -561,6 +691,71 @@ function createTableXml(array $tableData, bool $useTemplateStyle = false): strin
     $xml .= '</w:tbl>';
     return $xml;
 }
+
+/**
+ * Generate WordprocessingML for a full table, optionally using template styling and user-specified colors.
+ */
+function createTableXml_old(array $tableData, bool $useTemplateStyle = false): string
+{
+    if (empty($tableData)) {
+        return '';
+    }
+
+    $xml = '<w:tbl xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">';
+    // Use template styling if available, otherwise default
+    $xml .= $useTemplateStyle
+        ? '<w:tblPr>
+            <w:tblStyle w:val="TableGrid"/>
+            <w:tblW w:w="5000" w:type="dxa"/>
+            <w:tblBorders>
+                <w:top w:val="single" w:color="000000" w:sz="12"/>
+                <w:left w:val="single" w:color="000000" w:sz="12"/>
+                <w:bottom w:val="single" w:color="000000" w:sz="12"/>
+                <w:right w:val="single" w:color="000000" w:sz="12"/>
+                <w:insideH w:val="single" w:color="000000" w:sz="12"/>
+                <w:insideV w:val="single" w:color="000000" w:sz="12"/>
+            </w:tblBorders>
+          </w:tblPr>'
+        : '<w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="0" w:type="auto"/></w:tblPr>';
+    $xml .= '<w:tblGrid>';
+
+    // Assume equal column widths for simplicity
+    $colCount = count(isset($tableData[0]) ? $tableData[0] : []);
+    for ($i = 0; $i < $colCount; $i++) {
+        $xml .= '<w:gridCol w:w="' . ($useTemplateStyle ? 1250 : 0) . '"/>';
+    }
+    $xml .= '</w:tblGrid>';
+
+    foreach ($tableData as $rowIndex => $row) {
+        $xml .= '<w:tr>';
+        foreach ($row as $cellIndex => $cellData) {
+            $cellValue = is_array($cellData) ? ($cellData['value'] ?? $cellData) : $cellData;
+            $bgColor = is_array($cellData) && isset($cellData['bgColor']) ? $cellData['bgColor'] : ($rowIndex == 0 && $useTemplateStyle ? '0070C0' : null);
+            $fontColor = is_array($cellData) && isset($cellData['fontColor']) ? $cellData['fontColor'] : ($rowIndex == 0 && $useTemplateStyle ? 'FFFFFF' : ($rowIndex > 0 && $cellIndex == $colCount - 1 && $useTemplateStyle ? '00B050' : null));
+
+            $xml .= '<w:tc>';
+            $xml .= '<w:tcPr><w:tcW w:w="' . ($useTemplateStyle ? 1250 : 0) . '" w:type="dxa"/>';
+            if ($bgColor) {
+                $xml .= "<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"$bgColor\"/>";
+            }
+            $xml .= '</w:tcPr>';
+            $xml .= '<w:p><w:pPr><w:jc w:val="' . ($useTemplateStyle ? 'center' : 'left') . '"/></w:pPr><w:r>';
+            if ($fontColor) {
+                $xml .= "<w:rPr><w:sz w:val=\"" . ($rowIndex == 0 && $useTemplateStyle ? 24 : 22) . "\"/><w:color w:val=\"$fontColor\"/></w:rPr>";
+            } elseif ($useTemplateStyle) {
+                $xml .= '<w:rPr><w:sz w:val="' . ($rowIndex == 0 ? 24 : 22) . '"/></w:rPr>';
+            }
+            $xml .= '<w:t>' . htmlspecialchars((string)$cellValue, ENT_QUOTES, 'UTF-8') . '</w:t>';
+            $xml .= '</w:r></w:p>';
+            $xml .= '</w:tc>';
+        }
+        $xml .= '</w:tr>';
+    }
+
+    $xml .= '</w:tbl>';
+    return $xml;
+}
+
 /**
  * Get MIME type for image extension.
  */
@@ -577,42 +772,115 @@ function getImageMimeType(string $extension): ?string
 }
 
 // ------------------------------ Example usage ------------------------------
+
 $values = [
-    'variable' => 'Hello!....',
-    'employerName' => 'Google Inc.',
-    'CaseID' => 'BGV123456',
-    'cName' => 'John Doe',
+    'companyName' => 'Jersey Engineering Solutions Pvt Ltd.',
+    'CaseNo' => 'NADAL\Jersey\001\2023',
+    'fullName' => 'Karthikeyan A',
     'reportStatus' => 'Clear',
     'dob' => '1990-01-01',
+    'fatherName' => 'Arumugam',
     'requestDate' => '2025-08-20',
-    'cID' => 'CID-98765',
+    'caseId' => 'CID-98765',
     'reportDate' => '2025-08-21',
-    'img1' => [
+    'arg_ta(i)' => [
+        [
+            ['value' => '1', 'bgColor' => 'FFFF00', 'fontColor' => '000000'],
+            ['value' => 'Address Verification', 'bgColor' => 'FFFF00', 'fontColor' => '000000'],
+            ['value' => 'Verified', 'bgColor' => '00FF00', 'fontColor' => '000000'],
+            ['value' => 'Green', 'bgColor' => '00FF00', 'fontColor' => '000000']
+        ],
+        [
+            ['value' => '2', 'bgColor' => 'FFFFFF', 'fontColor' => 'FF0000'],
+            ['value' => 'Educational Verification', 'bgColor' => 'FFFFFF', 'fontColor' => 'FF0000'],
+            ['value' => 'Verified', 'bgColor' => '00FF00', 'fontColor' => '000000'],
+            ['value' => 'Green', 'bgColor' => '00FF00', 'fontColor' => '000000']
+        ]
+    ],
+    'arg_t(j)' => [
+        [
+            ['value' => 'fh A\43 Selvamaruthur Thisayanvelai Tirunelveli Tamil Nadu India', 'bgColor' => 'FFFF00', 'fontColor' => '000000'],
+            ['value' => 'UTA', 'bgColor' => '00FF00', 'fontColor' => '000000']
+        ],[
+            ['value' => 'fh A\43 Selvamaruthur Thisayanvelai Tirunelveli Tamil Nadu India', 'bgColor' => 'FFFF00', 'fontColor' => '000000'],
+            ['value' => 'UTA', 'bgColor' => '00FF00', 'fontColor' => '000000']
+        ],[
+            ['value' => 'fh A\43 Selvamaruthur Thisayanvelai Tirunelveli Tamil Nadu India', 'bgColor' => 'FFFF00', 'fontColor' => '000000'],
+            ['value' => 'UTA', 'bgColor' => '00FF00', 'fontColor' => '000000']
+        ]
+    ],
+    'addressAsAadhar' => '112/1,Arijan Colony, Eraiyadikal, Chengalakurichi,
+    Dohnavur, Tirunelveli,
+    Tamil Nadu - 627 612, India.',
+    'modeOfVerify' => 'Physically visited no one is available.',
+    'addressAsPresent' => '100, G3,Arputham Complex, 
+    Near Vivekanda School, Eruvadi,
+    Vallioor road, Anna Nagar, Vadakku Vallioor.',
+    'resName' => 'anithaa',
+    'relSubject' => 'Wife',
+    'resNumber' => '9876543210',
+    'resResidence' => 'Rented',
+    'resStay'=>'02 Years',
+    'mode' => 'Physical',
+    'remark' => 'Verified',
+    'add_img(i)'=>['1' => [
         'image' => 'C:\xampp\htdocs\test\pdfgenback\openxml\image1.jpg',
         'width' => 300,
         'height' => 300
     ],
-    'img2' => [
+    '2' => [
         'image' => 'C:\xampp\htdocs\test\pdfgenback\openxml\image2.jpg',
         'width' => 600,
         'height' => 400
-    ],
-    'tableData' => [
-        ['Column 1', 'Column 2', 'Column 3', 'Column 4'],
-        ['Row 1 Col 1', 'Row 1 Col 2', 'Row 1 Col 3', 'Row 1 Col 4'],
-        ['Row 2 Col 1', 'Row 2 Col 2', 'Row 2 Col 3', 'Row 2 Col 4']
-    ],
-    'arg_t(i)' => [
-        ['T1 R1 C1', 'T1 R1 C2', 'T1 R1 C3', 'T1 R1 C4'],
-        ['T1 R2 C1', 'T1 R2 C2', 'T1 R2 C3', 'T1 R2 C4'],
-    ],
-    'arg_ta(i)' => [
-        ['T2 R1 C1', 'T2 R1 C2', 'T2 R1 C3', 'T2 R1 C4'],
-        ['T2 R2 C1', 'T2 R2 C2', 'T2 R2 C3', 'T2 R2 C4'],
-    ],
+    ],],
+    'canDegeree' => 'Electrical and Electronics Engineering ',
+    'collegeLoc' => '#6, Tiruchendur Road, Vallioor, 
+                    Tirunelveli - 627 117.',
+    'yearOfpassed' => '2010',
+    'collegeName' => 'Vallioor Engineering College',
+    'universityname' => 'Anna University',
+    'addComm' => 'NADAL has checked the Fake University List and the University Grant Commission website. The University is NOT listed as fake or unaccredited.',
+    'verifierName' => 'R. Kalai Selvi',
+    'verifierDesignation' => 'HOD',
+    'deptName' => 'Department of Electrical and Electronics Engineering',
+    'edu_img(i)'=>['1' => [
+        'image' => 'C:\xampp\htdocs\test\pdfgenback\openxml\image1.jpg',
+        'width' => 300,
+        'height' => 300
+    ]],
+    'criDurationOfRecordsCheck' => '5 Years',
+    'criRemark' => 'No records found on the judiciary sites of Sessions Court, High Court, Magistrate Court and Civil Court for the address provided.',
+    'result' => 'All Verified 100% Clear',
+    'addDOV' => '2025-08-22',
+    'eduDOV' => '2006-05-15',
+    'eduTOV' => '12.19 PM',
+    'criDOV' => '2025-08-22',
+    'criSD' => '2025-08-22',
+    'criED' => '2025-08-22',
+    'successStatus' => '✓',
+    'failStatus' => '✖',
 ];
 $template = 'input.docx';
 $output = 'output.docx';
+
+// Check if template file exists
+if (!file_exists($template)) {
+    die("❌ Template file not found: $template\n");
+}
+
+// Check if template is readable
+if (!is_readable($template)) {
+    die("❌ Template file is not readable: $template\n");
+}
+
+// Check if output directory is writable
+$outputDir = dirname($output);
+if (!is_writable($outputDir)) {
+    die("❌ Output directory is not writable: $outputDir\n");
+}
+
+echo "📄 Template found: $template\n";
+echo "🔄 Processing...\n";
 
 replaceDocxPlaceholdersSmart($template, $output, $values);
 
